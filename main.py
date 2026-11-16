@@ -17,9 +17,33 @@ PORT = int(os.environ.get("PORT", "8080"))
 GATEWAY = os.environ.get("MAKEFUN_ENV_URL", "https://openrouter.ai/api/v1").rstrip("/")
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
+
+def _expand_twins(models: list) -> list:
+    """Add an in-memory gateway-alias twin (openrouter/<id>) for each model.
+
+    The make.fun house gateway dials only ids shaped openrouter/*:free while
+    the OpenRouter catalog lists native vendor/model:free ids, so each entry
+    gains a sibling with id='openrouter/'+id and alias_of=<native id>. The
+    result is sorted by id; catalog.json on disk is never rewritten.
+    """
+    out = []
+    have = set()
+    for c in models:
+        cid = c.get("id")
+        if isinstance(cid, str) and cid not in have:
+            have.add(cid)
+            out.append(dict(c))
+            if not cid.startswith("openrouter/"):
+                twin = dict(c)
+                twin["id"] = "openrouter/" + cid
+                twin["alias_of"] = cid
+                out.append(twin)
+    return sorted(out, key=lambda c: c["id"])
+
+
 # Vendored snapshot; refreshed live at startup when the gateway answers.
 with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "catalog.json"), encoding="utf-8") as _f:
-    CATALOG = json.load(_f)
+    CATALOG = _expand_twins(json.load(_f))
 
 # Canonical catalog document -- --list must print this byte for byte.
 CATALOG_DOC = json.dumps({"gateway": GATEWAY, "models": CATALOG}, separators=(",", ":"), sort_keys=True)
@@ -52,6 +76,69 @@ DEFAULT_MODELS = [
 FAILS = {}
 COOLDOWN_AFTER = 1  # after N refusals, park the model until chain exhausted
 
+# Dial-style latch: True = gateway only accepts openrouter/<id> aliases,
+# False = it accepts native ids, None = still probing. Deterministic: set
+# once by the first probe, never by clock or randomness.
+ALIAS_MODE = None
+
+# 4xx gateway rejections that mean "unknown/invalid model" (case-insensitive).
+_ALIAS_UNKNOWN_MODEL = ("no such model", "not a valid model", "no endpoints", "no allowed")
+
+
+def _error_mentions_unknown_model(body: str) -> bool:
+    low = (body or "").lower()
+    return any(w in low for w in _ALIAS_UNKNOWN_MODEL)
+
+
+def _gateway_post(model: str, openai_body: dict, stream: bool):
+    """Single dial site: POST one completion to the gateway."""
+    req = urllib.request.Request(
+        GATEWAY + "/chat/completions",
+        data=json.dumps({**openai_body, "model": model, "stream": stream}).encode(),
+        headers={
+            "Authorization": "Bearer " + OPENROUTER_KEY,
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    return urllib.request.urlopen(req, timeout=110)
+
+
+def gateway_chat(model: str, openai_body: dict, stream: bool):
+    """Dial `model` on the gateway, resolving the alias naming scheme.
+
+    ALIAS_MODE None probes 'openrouter/'+model first, then falls back to the
+    native id on a 4xx unknown-model rejection, latching whichever works into
+    ALIAS_MODE (True=alias, False=native). Alias-probe failures never touch
+    FAILS; only the final outcome does.
+    """
+    global ALIAS_MODE
+    if ALIAS_MODE is True:
+        return _gateway_post("openrouter/" + model if not model.startswith("openrouter/") else model, openai_body, stream)
+    if ALIAS_MODE is False:
+        return _gateway_post(model, openai_body, stream)
+    alias = model if model.startswith("openrouter/") else "openrouter/" + model
+    try:
+        resp = _gateway_post(alias, openai_body, stream)
+        ALIAS_MODE = True
+        return resp
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "replace")
+        except Exception:
+            pass
+        if 400 <= e.code < 500 and _error_mentions_unknown_model(body):
+            try:
+                resp = _gateway_post(model, openai_body, stream)
+                ALIAS_MODE = False
+                return resp
+            except urllib.error.HTTPError as e2:
+                FAILS[model] = FAILS.get(model, 0) + 1
+                raise e2
+        FAILS[model] = FAILS.get(model, 0) + 1
+        raise
+
 
 def pick_chain(body: dict, anthropic: bool) -> list:
     """Order candidate models for one request by declared capabilities."""
@@ -72,7 +159,10 @@ def pick_chain(body: dict, anthropic: bool) -> list:
         sys_text = "".join(m.get("content", "") for m in msgs if m.get("role") == "system")
     if any(w in sys_text.lower() for w in ("code", "function", "sql", "regex")):
         chain = CODE_MODELS + [m for m in chain if m not in CODE_MODELS]
-    return [m for m in chain if m in {c["id"] for c in CATALOG}]
+    ids = {c["id"] for c in CATALOG}
+    if "openrouter/" + chain[0] in ids and chain[0] not in ids:
+        chain = ["openrouter/" + m for m in chain]
+    return [m for m in chain if m in ids]
 
 
 def gateway_chat(model: str, openai_body: dict, stream: bool):
@@ -341,10 +431,10 @@ def main() -> None:
         )
         with urllib.request.urlopen(req, timeout=20) as r:
             doc = json.loads(r.read().decode("utf-8", "replace"))
-        live = sorted(
-            (c for c in doc.get("data", []) if str(c.get("id", "")).endswith(":free")),
-            key=lambda c: c["id"],
-        )
+        live = [
+            c for c in doc.get("data", []) if str(c.get("id", "")).endswith(":free")
+        ]
+        live = _expand_twins(live)
         if live:
             globals()["CATALOG"] = live
             globals()["CATALOG_DOC"] = json.dumps(
